@@ -1,7 +1,3 @@
-/* ======================================================================== */
-/* sqlite3-preload.c - Run SQLite commands on open via LD_PRELOAD           */
-/* Chase Venters <chase.venters@gmail.com> - Public Domain                  */
-/* ======================================================================== */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -10,137 +6,40 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ======================================================================== */
-/* ======================== Original Library Calls ======================== */
-/* ======================================================================== */
+/*
+Original library declarations, types and functions
+*/
 
-#define SQLITE_CANTOPEN 14
 struct sqlite3;
 typedef struct sqlite3 sqlite3;
+typedef struct sqlite3_stmt sqlite3_stmt;
+typedef void (*sqlite3_destructor_type)(void*);
+#define SQLITE_STATIC      ((sqlite3_destructor_type)0)
 
 static void *
 lib;
 
 static
-int (*orig_sqlite3_open) (const char *filename, sqlite3 **ppDb);
+ const char* (*orig_sqlite3_sql) (sqlite3_stmt *pStmt);
 
 static
-int (*orig_sqlite3_open16) (const char *filename, sqlite3 **ppDb);
+ char* (*orig_sqlite3_expanded_sql) (sqlite3_stmt *pStmt);
 
 static
-int (*orig_sqlite3_open_v2) (const char *filename, sqlite3 **ppDb, int flags,
-	const char *zVfs);
+ int (*orig_sqlite3_bind_text) (sqlite3_stmt*,int,const char*,int,void(*)(void*));
 
 static
-int (*orig_sqlite3_close) (sqlite3 *pDb);
+int (*orig_sqlite3_prepare_v2) (
+  sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+);
 
-static
-void (*orig_sqlite3_free) (void *data);
-
-static
-int (*orig_sqlite3_exec) (sqlite3 *pDb, const char *sql,
-	int (*callback)(void*,int,char**,char**), void *user, char **errmsg);
-
-/* ======================================================================== */
-/* =========================== Helper Functions =========================== */
-/* ======================================================================== */
-
-static void
-show_err (
-	const char *filename,
-	const char *op
-)
-{
-	char ebuf[256];
-	strerror_r(errno, ebuf, sizeof(ebuf));
-	fprintf(stderr, "SQLITE3_INIT_SQL(%s) - failed - %s (%d) %s\n",
-			filename, op, errno, ebuf);
-}
-
-/* ======================================================================== */
-
-static int
-read_file (
-	char **obuf
-)
-{
-	size_t sz_read, sz_buf, sz_buf_total, sz_need;
-	char rdbuf[1024];
-	char *buf, *nbuf;
-	int ret = 0;
-
-	/* see if we have a file to execute */
-	const char *filename = getenv("SQLITE3_INIT_SQL");
-	if (filename == 0) {
-		*obuf = 0;
-		return 0;
-	}
-
-	/* open the file */
-	FILE *file = fopen(filename, "r");
-	if (file == 0) {
-		show_err(filename, "cannot fopen()");
-		return -1;
-	}
-
-	/* allocate initial buffer */
-	sz_buf = 0;
-	sz_buf_total = 1024;
-	buf = malloc(1024);
-	if (buf == 0) {
-		show_err(filename, "cannot malloc()");
-		ret = -1;
-		goto out;
-	}
-
-	/* read file */
-	while (!feof(file)) {
-		/* read a data chunk */
-		sz_read = fread(rdbuf, 1, sizeof(rdbuf), file);
-		if (ferror(file)) {
-			show_err(filename, "cannot fread()");
-			ret = -1;
-			goto out;
-		}
-
-		/* grow buffer */
-		sz_need = sz_buf + sz_read + 1;
-		if (sz_need > sz_buf_total) {
-			sz_need += 4096;
-			nbuf = realloc(buf, sz_need);
-			if (nbuf == 0) {
-				show_err(filename, "cannot realloc()");
-				ret = -1;
-				goto out;
-			}
-			buf = nbuf;
-			sz_buf_total = sz_need;
-		}
-
-		/* copy data into buffer */
-		memcpy(buf + sz_buf, rdbuf, sz_read);
-		sz_buf += sz_read;
-	}
-
-	/* NULL-terminate */
-	buf[sz_buf] = 0;
-
-	/* donate buffer to caller */
-	*obuf = buf;
-	buf = 0;
-
-out:
-	/* release buffer */
-	free(buf);
-
-	/* close file */
-	fclose(file);
-
-	/* done! */
-	return ret;
-}
-
-/* ======================================================================== */
+/*
+Shim impl
+*/
 
 static void *
 get_sym (
@@ -163,8 +62,6 @@ get_sym (
 	return sym;
 }
 
-/* ======================================================================== */
-
 static void
 __attribute__((constructor))
 load_syms (void)
@@ -177,9 +74,7 @@ load_syms (void)
 		return;
 
 	/* load library */
-	library = getenv("SQLITE3_LIBRARY");
-	if (library == 0)
-		library = "libsqlite3.so.0";
+	library = "libsqlite3.so.0";
 	(void)dlerror();
 	lib = dlopen(library, RTLD_NOW|RTLD_GLOBAL);
 	err = dlerror();
@@ -191,132 +86,28 @@ load_syms (void)
 	}
 
 	/* load symbols */
-	orig_sqlite3_open = get_sym("sqlite3_open");
-	orig_sqlite3_open16 = get_sym("sqlite3_open16");
-	orig_sqlite3_open_v2 = get_sym("sqlite3_open_v2");
-	orig_sqlite3_exec = get_sym("sqlite3_exec");
-	orig_sqlite3_free = get_sym("sqlite3_free");
-	orig_sqlite3_close = get_sym("sqlite3_close");
+	orig_sqlite3_bind_text = get_sym("sqlite3_bind_text");
+	orig_sqlite3_prepare_v2 = get_sym("sqlite3_prepare_v2");
+	orig_sqlite3_sql = get_sym("sqlite3_sql");
+	orig_sqlite3_expanded_sql = get_sym("sqlite3_expanded_sql");
 }
 
-/* ======================================================================== */
-/* ============================ Hook Functions ============================ */
-/* ======================================================================== */
-
-int
-sqlite3_open (
-	const char *filename,
-	sqlite3 **ppDb
-)
-{
-	char *cmdbuf, *err;
-	int ret;
-
-	/* read SQL commands from file */
-	ret = read_file(&cmdbuf);
-	if (ret == -1)
-		return SQLITE_CANTOPEN;
-
-	/* open database */
-	ret = orig_sqlite3_open(filename, ppDb);
-	if (ret != 0) {
-		free(cmdbuf);
-		return ret;
-	}
-
-	/* execute command */
-	if (cmdbuf) {
-		ret = orig_sqlite3_exec(*ppDb, cmdbuf, 0, 0, &err);
-		free(cmdbuf);
-		if (ret != 0) {
-			fprintf(stderr, "sqlite3_open error: %s\n", err);
-			orig_sqlite3_free(err);
-			orig_sqlite3_close(*ppDb);
-			return SQLITE_CANTOPEN;
-		}
-	}
-
-	/* done! */
+int sqlite3_bind_text (sqlite3_stmt* stmt,int index,const char* binded,int num_of_bytes) {
+	fprintf(stdout, "bind_text:: %s\n", binded);
+	int ret = orig_sqlite3_bind_text(stmt,index,binded,num_of_bytes,SQLITE_STATIC);
+	fprintf(stdout,"bound:: %s\n", orig_sqlite3_expanded_sql(stmt));
 	return ret;
 }
 
-/* ======================================================================== */
-
-int sqlite3_open16 (
-	const void *filename,
-	sqlite3 **ppDb
-)
-{
-	char *cmdbuf, *err;
-	int ret;
-
-	/* read SQL commands from file */
-	ret = read_file(&cmdbuf);
-	if (ret == -1)
-		return SQLITE_CANTOPEN;
-
-	/* open database */
-	ret = orig_sqlite3_open16(filename, ppDb);
-	if (ret != 0) {
-		free(cmdbuf);
-		return ret;
-	}
-
-	/* execute command */
-	if (cmdbuf) {
-		ret = orig_sqlite3_exec(*ppDb, cmdbuf, 0, 0, &err);
-		free(cmdbuf);
-		if (ret != 0) {
-			fprintf(stderr, "sqlite3_open error: %s\n", err);
-			orig_sqlite3_free(err);
-			orig_sqlite3_close(*ppDb);
-			return SQLITE_CANTOPEN;
-		}
-	}
-
-	/* done! */
-	return ret;
+int sqlite3_prepare_v2 (
+sqlite3 *db,            /* Database handle */
+  const char *zSql,       /* SQL statement, UTF-8 encoded */
+  int nByte,              /* Maximum length of zSql in bytes. */
+  sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+  const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+){
+  fprintf(stdout,"prepare_v2:: %s\n", zSql);
+  int ret = orig_sqlite3_prepare_v2(db,zSql,nByte,ppStmt,pzTail);
+  fprintf(stdout,"prepared:: %s\n", orig_sqlite3_expanded_sql(*ppStmt));
+  return ret;
 }
-
-/* ======================================================================== */
-
-int sqlite3_open_v2 (
-	const char *filename,
-	sqlite3 **ppDb,
-	int flags,
-	const char *zVfs
-)
-{
-	char *cmdbuf, *err;
-	int ret;
-
-	/* read SQL commands from file */
-	ret = read_file(&cmdbuf);
-	if (ret == -1)
-		return SQLITE_CANTOPEN;
-
-	/* open database */
-	ret = orig_sqlite3_open_v2(filename, ppDb, flags, zVfs);
-	if (ret != 0) {
-		free(cmdbuf);
-		return ret;
-	}
-
-	/* execute command */
-	if (cmdbuf) {
-		ret = orig_sqlite3_exec(*ppDb, cmdbuf, 0, 0, &err);
-		free(cmdbuf);
-		if (ret != 0) {
-			fprintf(stderr, "sqlite3_open error: %s\n", err);
-			orig_sqlite3_free(err);
-			orig_sqlite3_close(*ppDb);
-			return SQLITE_CANTOPEN;
-		}
-	}
-
-	/* done! */
-	return ret;
-}
-
-/* ======================================================================== */
-
